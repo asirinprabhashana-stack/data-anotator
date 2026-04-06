@@ -1,0 +1,13 @@
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.orm import Session
+from passlib.context import CryptContext
+# ... (imports and models)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+@app.post("/register")
+def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    hashed_password = pwd_context.hash(user.password)
+    db_user = User(email=user.email, hashed_password=hashed_password)
+    db.add(db_user)
+    db.commit()
+    return {"message": "User created successfully"}
