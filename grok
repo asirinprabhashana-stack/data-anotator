@@ -1,0 +1,201 @@
+# ================================================
+# FULL EXAMPLE: FastAPI User Registration Endpoint
+# ================================================
+# This follows FastAPI + SQLAlchemy best practices:
+# • Dependency injection via `Depends(get_db)`
+# • Separate concerns (database, models, schemas, CRUD, utils)
+# • Password hashing with `passlib[bcrypt]`
+# • PostgreSQL via SQLAlchemy
+# • Pydantic v2 style (model_config)
+# • Proper error handling & uniqueness checks
+# ================================================
+
+# ======================
+# 1. database.py
+# ======================
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.ext.declarative import declarative_base
+import os
+
+# Use environment variable for security (never hard-code credentials in production)
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5432/fastapi_db"  # ← change for your setup
+)
+
+engine = create_engine(DATABASE_URL, echo=False)  # echo=True for debugging only
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+def get_db() -> Session:
+    """Dependency injection for database session.
+    FastAPI will call this on every request and close the session automatically."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ======================
+# 2. models.py
+# ======================
+from sqlalchemy import Column, Integer, String
+from .database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+
+
+# ======================
+# 3. schemas.py
+# ======================
+from pydantic import BaseModel, EmailStr, ConfigDict
+
+
+class UserCreate(BaseModel):
+    """Request body for registration"""
+    username: str
+    email: EmailStr
+    password: str
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "username": "johndoe",
+                "email": "john@example.com",
+                "password": "SuperSecret123!"
+            }
+        }
+    )
+
+
+class UserOut(BaseModel):
+    """Response model (never returns plain password)"""
+    id: int
+    username: str
+    email: EmailStr
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================
+# 4. utils.py (password hashing)
+# ======================
+from passlib.context import CryptContext
+
+# Passlib CryptContext with bcrypt (industry standard, automatically handles salt)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def get_password_hash(password: str) -> str:
+    """Hash password using passlib + bcrypt"""
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Utility for future login endpoint (included for completeness)"""
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+# ======================
+# 5. crud.py
+# ======================
+from sqlalchemy.orm import Session
+from .models import User
+from .schemas import UserCreate
+from .utils import get_password_hash
+from fastapi import HTTPException, status
+
+
+def get_user_by_username(db: Session, username: str) -> User | None:
+    return db.query(User).filter(User.username == username).first()
+
+
+def get_user_by_email(db: Session, email: str) -> User | None:
+    return db.query(User).filter(User.email == email).first()
+
+
+def create_user(db: Session, user: UserCreate) -> User:
+    """Create new user with hashed password"""
+    hashed_password = get_password_hash(user.password)
+
+    db_user = User(
+        username=user.username,
+        email=user.email,
+        hashed_password=hashed_password,
+    )
+
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+
+# ======================
+# 6. main.py (or routers/auth.py)
+# ======================
+from fastapi import FastAPI, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from .database import engine, Base, get_db
+from .models import User
+from .schemas import UserCreate, UserOut
+from .crud import get_user_by_username, get_user_by_email, create_user
+
+# Create tables on startup (in production use Alembic migrations!)
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="FastAPI User Registration Example")
+
+
+@app.post(
+    "/register",
+    response_model=UserOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a new user",
+    description="Creates a new user with bcrypt-hashed password",
+)
+def register_user(
+    user_in: UserCreate,
+    db: Session = Depends(get_db),   # ← Best-practice dependency injection
+):
+    """FastAPI endpoint with dependency injection for DB session"""
+    
+    # Uniqueness checks (prevent duplicate accounts)
+    if get_user_by_username(db, user_in.username):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already registered",
+        )
+    
+    if get_user_by_email(db, user_in.email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered",
+        )
+
+    # Create user (password is hashed inside create_user)
+    db_user = create_user(db=db, user=user_in)
+
+    return db_user
+
+
+# ======================
+# How to run
+# ======================
+# 1. pip install fastapi[standard] sqlalchemy psycopg2-binary passlib[bcrypt] pydantic[email]
+# 2. Set DATABASE_URL environment variable (or update database.py)
+# 3. uvicorn main:app --reload
+# 4. Test with:
+#    curl -X POST "http://127.0.0.1:8000/register" \
+#         -H "Content-Type: application/json" \
+#         -d '{"username":"testuser","email":"test@example.com","password":"MyStrongPass123!"}'
